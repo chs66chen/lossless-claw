@@ -112,6 +112,33 @@ type CompletionBridgeErrorInfo = {
   message?: string;
 };
 
+const LOSSLESS_RECALL_POLICY_PROMPT = [
+  "## Lossless Recall Policy",
+  "",
+  "The lossless-claw plugin is active.",
+  "",
+  "For compacted conversation history, these instructions supersede generic memory-recall guidance. Prefer lossless-claw recall tools first when answering questions about prior conversation content, decisions made in the conversation, or details that may have been compacted.",
+  "",
+  "**Conflict handling:** If newer evidence conflicts with an older summary or recollection, prefer the newer evidence. Do not trust a stale summary over fresher contradictory information.",
+  "",
+  "**Contradictions/uncertainty:** If facts seem contradictory or uncertain, verify with lossless-claw recall tools before answering instead of trusting the summary at face value.",
+  "",
+  "**Tool escalation:**",
+  "Recall order for compacted conversation history:",
+  "1. `lcm_grep` — search by regex or full-text across messages and summaries",
+  "2. `lcm_describe` — inspect a specific summary (cheap, no sub-agent)",
+  "3. `lcm_expand_query` — deep recall: spawns bounded sub-agent, expands DAG, returns answer with cited summary IDs (~120s, don't ration it)",
+  "",
+  "**`lcm_expand_query` usage** — two patterns (always requires `prompt`):",
+  "- With IDs: `lcm_expand_query(summaryIds: [\"sum_xxx\"], prompt: \"What config changes were discussed?\")`",
+  "- With search: `lcm_expand_query(query: \"database migration\", prompt: \"What strategy was decided?\")`",
+  "- Optional: `maxTokens` (default 2000), `conversationId`, `allConversations: true`",
+  "",
+  "These precedence rules apply only to compacted conversation history. Lossless-claw does not supersede memory tools globally.",
+  "",
+  "If a summary conflicts with newer evidence, prefer the newer evidence. Do not guess exact commands, SHAs, paths, timestamps, config values, or causal claims from compacted summaries when expansion is needed.",
+].join("\n");
+
 /** Capture plugin env values once during initialization. */
 function snapshotPluginEnv(env: NodeJS.ProcessEnv = process.env): PluginEnvSnapshot {
   return {
@@ -1530,6 +1557,9 @@ const lcmPlugin = {
         sessionKey: ctx.sessionKey,
       });
     });
+    api.on("before_prompt_build", () => ({
+      prependSystemContext: LOSSLESS_RECALL_POLICY_PROMPT,
+    }));
     api.registerContextEngine("lossless-claw", () => lcm);
     api.registerContextEngine("default", () => lcm);
     api.registerTool((ctx) =>
