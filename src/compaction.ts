@@ -68,7 +68,14 @@ type CompactionSummarizeFn = (
   aggressive?: boolean,
   options?: CompactionSummarizeOptions,
 ) => Promise<string>;
-type PassResult = { summaryId: string; level: CompactionLevel };
+type PassResult = {
+  summaryId: string;
+  level: CompactionLevel;
+  /** Token count of source items removed from context. */
+  removedTokens: number;
+  /** Token count of the newly created summary. */
+  addedTokens: number;
+};
 type LeafChunkSelection = {
   items: ContextItemRecord[];
   rawTokensOutsideTail: number;
@@ -335,11 +342,57 @@ function isMediaAttachmentPart(part: CreateMessagePartInput | { partType: string
 // ── CompactionEngine ─────────────────────────────────────────────────────────
 
 export class CompactionEngine {
+  /**
+   * Per-conversation context items cache, active only during compaction
+   * entry points. null when inactive — external callers (e.g., engine.ts
+   * evaluateLeafTrigger) get uncached reads.
+   *
+   * Uses a reference count so concurrent compactions on different
+   * conversations don't interfere: each withContextCache increments
+   * on entry and decrements on exit; the cache is only destroyed
+   * when all users have exited.
+   */
+  private _contextItemsCache: Map<number, ContextItemRecord[]> | null = null;
+  private _contextItemsCacheRefCount = 0;
+
   constructor(
     private conversationStore: ConversationStore,
     private summaryStore: SummaryStore,
     private config: CompactionConfig,
   ) {}
+
+  /** Read context items, using per-phase cache when active. */
+  private async getContextItemsCached(conversationId: number): Promise<ContextItemRecord[]> {
+    if (this._contextItemsCache) {
+      if (this._contextItemsCache.has(conversationId)) {
+        return this._contextItemsCache.get(conversationId)!;
+      }
+      const items = await this.summaryStore.getContextItems(conversationId);
+      this._contextItemsCache.set(conversationId, items);
+      return items;
+    }
+    return this.summaryStore.getContextItems(conversationId);
+  }
+
+  /** Invalidate cache for a conversation after context mutation. */
+  private invalidateContextCache(conversationId: number): void {
+    this._contextItemsCache?.delete(conversationId);
+  }
+
+  /** Execute with context cache active. Reference-counted for concurrent use. */
+  private async withContextCache<T>(fn: () => Promise<T>): Promise<T> {
+    if (!this._contextItemsCache) this._contextItemsCache = new Map();
+    this._contextItemsCacheRefCount++;
+    try {
+      return await fn();
+    } finally {
+      this._contextItemsCacheRefCount--;
+      if (this._contextItemsCacheRefCount <= 0) {
+        this._contextItemsCache = null;
+        this._contextItemsCacheRefCount = 0;
+      }
+    }
+  }
 
   // ── evaluate ─────────────────────────────────────────────────────────────
 
@@ -409,7 +462,7 @@ export class CompactionEngine {
     hardTrigger?: boolean;
     summaryModel?: string;
   }): Promise<CompactionResult> {
-    return this.compactFullSweep(input);
+    return this.withContextCache(() => this.compactFullSweep(input));
   }
 
   /**
@@ -418,6 +471,17 @@ export class CompactionEngine {
    * This is the soft-trigger path used for incremental maintenance.
    */
   async compactLeaf(input: {
+    conversationId: number;
+    tokenBudget: number;
+    summarize: CompactionSummarizeFn;
+    force?: boolean;
+    previousSummaryContent?: string;
+    summaryModel?: string;
+  }): Promise<CompactionResult> {
+    return this.withContextCache(() => this._compactLeafImpl(input));
+  }
+
+  private async _compactLeafImpl(input: {
     conversationId: number;
     tokenBudget: number;
     summarize: CompactionSummarizeFn;
@@ -470,7 +534,8 @@ export class CompactionEngine {
         authFailure: true,
       };
     }
-    const tokensAfterLeaf = await this.summaryStore.getContextTokenCount(conversationId);
+    // Delta tracking: compute token change from pass results instead of re-querying DB
+    const tokensAfterLeaf = tokensBefore - leafResult.removedTokens + leafResult.addedTokens;
 
     await this.persistCompactionEvents({
       conversationId,
@@ -488,6 +553,7 @@ export class CompactionEngine {
 
     const incrementalMaxDepth = this.resolveIncrementalMaxDepth();
     const condensedMinChunkTokens = this.resolveCondensedMinChunkTokens();
+    let runningTokens = tokensAfterLeaf;
     if (incrementalMaxDepth > 0) {
       for (let targetDepth = 0; targetDepth < incrementalMaxDepth; targetDepth++) {
         const fanout = this.resolveFanoutForDepth(targetDepth, false);
@@ -496,7 +562,7 @@ export class CompactionEngine {
           break;
         }
 
-        const passTokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
+        const passTokensBefore = runningTokens;
         const condenseResult = await this.condensedPass(
           conversationId,
           chunk.items,
@@ -507,7 +573,7 @@ export class CompactionEngine {
         if (!condenseResult) {
           break;
         }
-        const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
+        const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
         await this.persistCompactionEvents({
           conversationId,
           tokensBefore: passTokensBefore,
@@ -518,6 +584,7 @@ export class CompactionEngine {
         });
 
         tokensAfter = passTokensAfter;
+        runningTokens = passTokensAfter;
         condensed = true;
         createdSummaryId = condenseResult.summaryId;
         level = condenseResult.level;
@@ -568,7 +635,7 @@ export class CompactionEngine {
       };
     }
 
-    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    const contextItems = await this.getContextItemsCached(conversationId);
     if (contextItems.length === 0) {
       return {
         actionTaken: false,
@@ -587,13 +654,16 @@ export class CompactionEngine {
     let hadAuthFailure = false;
 
     // Phase 1: leaf passes over oldest raw chunks outside the protected tail.
+    // Delta tracking: maintain a running token count instead of re-querying DB
+    // after each pass. The arithmetic is exact: tokensAfter = tokensBefore - removed + added.
+    let runningTokens = tokensBefore;
     while (true) {
       const leafChunk = await this.selectOldestLeafChunk(conversationId);
       if (leafChunk.items.length === 0) {
         break;
       }
 
-      const passTokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
+      const passTokensBefore = runningTokens;
       const leafResult = await this.leafPass(
         conversationId,
         leafChunk.items,
@@ -605,7 +675,7 @@ export class CompactionEngine {
         hadAuthFailure = true;
         break;
       }
-      const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
+      const passTokensAfter = passTokensBefore - leafResult.removedTokens + leafResult.addedTokens;
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -619,6 +689,7 @@ export class CompactionEngine {
       createdSummaryId = leafResult.summaryId;
       level = leafResult.level;
       previousSummaryContent = leafResult.content;
+      runningTokens = passTokensAfter;
 
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
@@ -640,7 +711,7 @@ export class CompactionEngine {
         break;
       }
 
-      const passTokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
+      const passTokensBefore = runningTokens;
       const condenseResult = await this.condensedPass(
         conversationId,
         candidate.chunk.items,
@@ -652,7 +723,7 @@ export class CompactionEngine {
         hadAuthFailure = true;
         break;
       }
-      const passTokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
+      const passTokensAfter = passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens;
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -666,6 +737,7 @@ export class CompactionEngine {
       condensed = true;
       createdSummaryId = condenseResult.summaryId;
       level = condenseResult.level;
+      runningTokens = passTokensAfter;
 
       if (!force && passTokensAfter <= threshold) {
         previousTokens = passTokensAfter;
@@ -677,7 +749,7 @@ export class CompactionEngine {
       previousTokens = passTokensAfter;
     }
 
-    const tokensAfter = await this.summaryStore.getContextTokenCount(conversationId);
+    const tokensAfter = runningTokens;
 
     return {
       actionTaken,
@@ -694,6 +766,17 @@ export class CompactionEngine {
 
   /** Compact until under the requested target, running up to maxRounds. */
   async compactUntilUnder(input: {
+    conversationId: number;
+    tokenBudget: number;
+    targetTokens?: number;
+    currentTokens?: number;
+    summarize: CompactionSummarizeFn;
+    summaryModel?: string;
+  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+    return this.withContextCache(() => this._compactUntilUnderImpl(input));
+  }
+
+  private async _compactUntilUnderImpl(input: {
     conversationId: number;
     tokenBudget: number;
     targetTokens?: number;
@@ -763,8 +846,8 @@ export class CompactionEngine {
       lastTokens = result.tokensAfter;
     }
 
-    // Exhausted all rounds
-    const finalTokens = await this.summaryStore.getContextTokenCount(conversationId);
+    // Exhausted all rounds — use the last known token count from compact() result
+    const finalTokens = lastTokens;
     return {
       success: finalTokens <= targetTokens,
       rounds: this.config.maxRounds,
@@ -838,7 +921,7 @@ export class CompactionEngine {
 
   /** Sum raw message tokens outside the protected fresh tail. */
   private async countRawTokensOutsideFreshTail(conversationId: number): Promise<number> {
-    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
     let rawTokens = 0;
 
@@ -862,7 +945,7 @@ export class CompactionEngine {
    * at least one message when any compactable message exists.
    */
   private async selectOldestLeafChunk(conversationId: number): Promise<LeafChunkSelection> {
-    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
     const threshold = this.resolveLeafChunkTokens();
 
@@ -927,7 +1010,7 @@ export class CompactionEngine {
     }
 
     const startOrdinal = Math.min(...messageItems.map((item) => item.ordinal));
-    const priorSummaryItems = (await this.summaryStore.getContextItems(conversationId))
+    const priorSummaryItems = (await this.getContextItemsCached(conversationId))
       .filter(
         (item) =>
           item.ordinal < startOrdinal &&
@@ -1051,7 +1134,7 @@ export class CompactionEngine {
     hardTrigger: boolean;
   }): Promise<CondensedPhaseCandidate | null> {
     const { conversationId, hardTrigger } = params;
-    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal = this.resolveFreshTailOrdinal(contextItems);
     const minChunkTokens = this.resolveCondensedMinChunkTokens();
     const depthLevels = await this.summaryStore.getDistinctDepthsInContext(conversationId, {
@@ -1088,7 +1171,7 @@ export class CompactionEngine {
     targetDepth: number,
     freshTailOrdinalOverride?: number,
   ): Promise<CondensedChunkSelection> {
-    const contextItems = await this.summaryStore.getContextItems(conversationId);
+    const contextItems = await this.getContextItemsCached(conversationId);
     const freshTailOrdinal =
       typeof freshTailOrdinalOverride === "number"
         ? freshTailOrdinalOverride
@@ -1147,7 +1230,7 @@ export class CompactionEngine {
     }
 
     const startOrdinal = Math.min(...summaryItems.map((item) => item.ordinal));
-    const priorSummaryItems = (await this.summaryStore.getContextItems(conversationId))
+    const priorSummaryItems = (await this.getContextItemsCached(conversationId))
       .filter(
         (item) =>
           item.ordinal < startOrdinal &&
@@ -1330,7 +1413,7 @@ export class CompactionEngine {
     summarize: CompactionSummarizeFn,
     previousSummaryContent?: string,
     summaryModel?: string,
-  ): Promise<{ summaryId: string; level: CompactionLevel; content: string } | null> {
+  ): Promise<{ summaryId: string; level: CompactionLevel; content: string; removedTokens: number; addedTokens: number } | null> {
     // Fetch full message content for each context item
     const messageContents: { messageId: number; content: string; createdAt: Date; tokenCount: number }[] =
       [];
@@ -1378,6 +1461,16 @@ export class CompactionEngine {
     // Persist the leaf summary
     const summaryId = generateSummaryId(summary.content);
     const tokenCount = estimateTokens(summary.content);
+    // Note: removedTokens uses resolveMessageTokenCount values (which fall back to
+    // estimateTokens for messages with token_count <= 0). This can diverge from
+    // getContextTokenCount() which would sum the stored 0. The delta feeds into
+    // stopping decisions (threshold checks, progress guards), but the divergence
+    // is bounded to empty/corrupt messages (token_count=0) which are rare.
+    // For summaries, removedTokens matches the DB exactly (same tokenCount column).
+    const removedTokens = messageContents.reduce(
+      (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
+      0,
+    );
 
     await this.summaryStore.withTransaction(async () => {
       await this.summaryStore.insertSummary({
@@ -1398,10 +1491,7 @@ export class CompactionEngine {
             : undefined,
         descendantCount: 0,
         descendantTokenCount: 0,
-        sourceMessageTokenCount: messageContents.reduce(
-          (sum, message) => sum + Math.max(0, Math.floor(message.tokenCount)),
-          0,
-        ),
+        sourceMessageTokenCount: removedTokens,
         model: summaryModel,
       });
 
@@ -1421,8 +1511,9 @@ export class CompactionEngine {
         summaryId,
       });
     });
+    this.invalidateContextCache(conversationId);
 
-    return { summaryId, level: summary.level, content: summary.content };
+    return { summaryId, level: summary.level, content: summary.content, removedTokens, addedTokens: tokenCount };
   }
 
   // ── Private: Condensed Pass ──────────────────────────────────────────────
@@ -1560,8 +1651,13 @@ export class CompactionEngine {
         summaryId,
       });
     });
+    this.invalidateContextCache(conversationId);
 
-    return { summaryId, level: condensed.level };
+    const removedTokens = summaryRecords.reduce(
+      (sum, s) => sum + Math.max(0, Math.floor(s.tokenCount)),
+      0,
+    );
+    return { summaryId, level: condensed.level, removedTokens, addedTokens: tokenCount };
   }
 
   /** Emit compaction telemetry without mutating canonical conversation history. */
