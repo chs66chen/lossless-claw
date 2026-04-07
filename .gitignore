@@ -12,3 +12,4 @@ tui/tui
 # CE planning artifacts
 docs/plans/
 TASK.md
+.pebbles/
